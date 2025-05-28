@@ -334,7 +334,7 @@ EXIF_SUPPORT_LEVELS = {
     "DateTimeOriginal": {
         "tag": b"\x90\x03",
         "support": {
-            "uncompressed": {"chunky": "O", "planar": "O", "ycc": "O"},
+            "uncompressed": {"chunky":  "O", "planar": "O", "ycc": "O"},
             "compressed": "O",
         },
     },

@@ -26,14 +26,17 @@ def calculate_header_validity(e: int, t: int, b: int) -> float:
 def calculate_tag_validity_score(tags: list[dict]) -> float:
     N = len(tags)
     if N == 0:
-        return
+        return 0.0
     penalties = []
+    unknown_count = 0  
     for tag in tags:
         type_correct = tag.get("type_valid", False)
         count_correct = tag.get("count_valid", False)
         struct_i = (int(type_correct) + int(count_correct)) / 2
         present_i = tag.get("present", False)
         support = tag.get("support_level", "O")
+        if support == "U":
+            unknown_count += 1
         penalty_func = PENALTY_SCALE.get(support, lambda present, struct: 0)
         penalty = penalty_func(present_i, struct_i)
         penalties.append(penalty)
@@ -77,9 +80,12 @@ def kendall_tau_distance(order: list[int]) -> float:
 def calculate_lazy_TOS(all_tags: list[int], baseline: list[bytes]) -> float:
     observed_order = [
         tag["tag_id"]
-        for tag in sorted(all_tags, key=lambda x: x.get("order", 0))
-        if tag.get("tag_id") in baseline
+        for tag in sorted(all_tags, key=lambda x: x.get("order", 9999))
+        if tag.get("tag_id") and tag.get("tag_id") in baseline
     ]
+
+    if not observed_order:
+        return 0.0
 
     baseline_filtered = [tag for tag in baseline if tag in observed_order]
 
@@ -89,7 +95,7 @@ def calculate_lazy_TOS(all_tags: list[int], baseline: list[bytes]) -> float:
     return kendall_tau_distance(indexed_order)
 
 
-def calculate_strict_TOS(observed: list[int], baseline: list[dict]) -> float:
+def calculate_strict_TOS(observed: list[bytes], baseline: list[bytes]) -> float:
     overlap = [tag for tag in observed if tag in baseline]
     if not overlap:
         return 0.0

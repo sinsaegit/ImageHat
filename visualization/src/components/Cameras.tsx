@@ -1,6 +1,8 @@
 import {useEffect, useState} from "react";
 import BarChart, {DataPoint} from "../BarChart.tsx";
 
+
+
 async function getTagNames() {
     const { db } = await import("../duckdb");
     const conn = await db.connect();
@@ -123,3 +125,4 @@ const Cameras = () => {
 };
 
 export default Cameras;
+

@@ -1,6 +1,8 @@
 import os
 import os.path
 import struct
+import binascii
+
 from rich.pretty import pprint as rich_print
 from imagehat.parsers.base_parser import BaseParser
 from imagehat.identifiers.extensions import VALID_EXTENSIONS
@@ -752,57 +754,26 @@ class JPEGParser(BaseParser):
         """
         Parses an identified EXIF tag within the `_read_ifd()` method, ensuring that
         the tag is processed according to its byte size and recorded data type.
-
-        If the tag's value field exceeds 4 bytes, the function retrieves the value
-        from the appropriate offset in the APP1 segment.
-
-        :param tag: The tag identifier in bytes.
-        :type tag: bytes
-
-        :param data_type: The numeric representation of the tag’s data type.
-        :type data_type: int
-
-        :param count: The number of data values associated with the tag.
-        :type count: int
-
-        :param value: The recorded value of the tag (or an offset if the value is stored elsewhere).
-        :type value: int
-
-        :param entry_offset: The absolute offset of the tag entry within the EXIF data.
-        :type entry_offset: int
-
-        :param tiff_offset: The TIFF header offset used for relative positioning.
-        :type tiff_offset: int
-
-        :param endianness: The endianness of the EXIF data ('<' for little-endian, '>' for big-endian).
-        :type endianness: str
-
-        :param order: The order of the tag within the parsed EXIF structure.
-        :type order: int
-
-        :return: A dictionary containing detailed tag information. If the tag’s value exceeds 4 bytes,
-                 the content is extracted from the APP1 segment.
-        :rtype: dict
         """
 
-        type_name = TAG_TYPES.get(
-            data_type, "UNDEFINED"
-        )  # Fetches type UNDEFINED if fails
+        type_name = TAG_TYPES.get(data_type, "UNDEFINED")
         doc_type = self._get_tag_type(tag=tag, endianness=endianness)
         doc_count = self._get_tag_count(tag=tag, endianness=endianness)
 
         size_of_type = TAG_TYPE_SIZE_BYTES.get(type_name, 1)
         total_data_length = count * size_of_type
         absolute_offset = value + tiff_offset + self.marker_info["APP1"]["offset"]
+        absolute_entry_offset = entry_offset + self.marker_info["APP1"]["offset"]
 
-        is_overflow = total_data_length > 4 or type_name in OVERFLOW_TYPES
-        # is_big = int(value) > 1024
-
+        is_overflow = total_data_length > 4 or (
+            type_name in OVERFLOW_TYPES and total_data_length != 4
+        )
         if is_overflow:
             content_bytes = self._APP1_SEGMENT[
                 value + tiff_offset : value + tiff_offset + total_data_length
             ]
             content_offset = value
+
             if total_data_length > 50:
                 value = f"Deferred @ abs offset: {absolute_offset}"
             elif type_name in RATIONAL_TYPES:
@@ -815,17 +786,40 @@ class JPEGParser(BaseParser):
                 except Exception:
                     value = content_bytes.hex()
             elif type_name == "UNDEFINED":
-                value = content_bytes.hex()
+                # If it looks printable, decode it (e.g., b"0220"), else show raw hex
+                try:
+                    decoded = content_bytes.decode("utf-8")
+                    if all(
+                        32 <= ord(c) <= 126 or c in "\x00" for c in decoded
+                    ):  # printable or null
+                        value = decoded.strip("\x00")
+                    else:
+                        value = content_bytes.hex()
+                except Exception:
+                    value = content_bytes.hex()
             elif type_name == "FLOAT":
                 value = struct.unpack(f"{endianness}f", content_bytes[:4])[0]
             elif type_name == "DOUBLE":
                 value = struct.unpack(f"{endianness}d", content_bytes[:8])[0]
+            elif count > 1:
+                raw_values = [
+                    int.from_bytes(
+                        content_bytes[i * size_of_type : (i + 1) * size_of_type],
+                        endianness,
+                    )
+                    for i in range(count)
+                ]
+                value = {
+                    "values": raw_values,
+                    "display": ", ".join(str(v) for v in raw_values),
+                }
+
             else:
                 value = int.from_bytes(content_bytes[:4], endianness)
 
             return {
-                "Markup": f"[{entry_offset}:{entry_offset+12}]",
-                "Absolute Offset": entry_offset,
+                "Markup": f"[{absolute_entry_offset}:{absolute_entry_offset + 12}]",
+                "Absolute Offset": absolute_entry_offset,
                 "TIFF Offset": entry_offset - tiff_offset,
                 "Recorded Type": data_type,
                 "Type": type_name,
@@ -835,13 +829,15 @@ class JPEGParser(BaseParser):
                 "Value Field Points To": absolute_offset,
                 "Content Bytes": content_offset,
                 "Content Value": value,
+                "Content Value": value["display"] if isinstance(value, dict) else value,
+                "Raw Values": value["values"] if isinstance(value, dict) else None,
                 "IFD Tag Order": order,
             }
 
+        # Handle inline values properly (4-byte field in tag entry)
         inline_bytes = value.to_bytes(
             4, byteorder="little" if endianness == "<" else "big"
         )
-        byteorder_str = "little" if endianness == "<" else "big"
 
         if type_name in ["ASCII", "UTF-8"]:
             try:
@@ -853,14 +849,25 @@ class JPEGParser(BaseParser):
             content_value = decoded
         elif type_name in RATIONAL_TYPES:
             content_value = self._parse_rational(inline_bytes, endianness)
+        elif type_name == "UNDEFINED":
+            try:
+                decoded = inline_bytes.decode("utf-8")
+                if all(32 <= ord(c) <= 126 or c in "\x00" for c in decoded):
+                    content_value = decoded.strip("\x00")
+                else:
+                    content_value = inline_bytes.hex()
+            except Exception:
+                content_value = inline_bytes.hex()
         elif type_name == "FLOAT":
             content_value = struct.unpack(f"{endianness}f", inline_bytes[:4])[0]
         else:
-            content_value = int.from_bytes(inline_bytes[:4], byteorder_str)
+            content_value = self._unpack_inline_value(
+                inline_bytes, type_name, endianness
+            )
 
         return {
-            "Markup": f"[{entry_offset}:{entry_offset+12}]",
-            "Absolute Offset": entry_offset,
+            "Markup": f"[{absolute_entry_offset}:{absolute_entry_offset+12}]",
+            "Absolute Offset": absolute_entry_offset,
             "TIFF Offset": entry_offset - tiff_offset,
             "Recorded Type": data_type,
             "Type": type_name,
@@ -871,6 +878,29 @@ class JPEGParser(BaseParser):
             "Content Value": content_value,
             "IFD Tag Order": order,
         }
+
+    def _unpack_inline_value(
+        self, inline_bytes: bytes, type_name: str, endianness: str
+    ):
+        endian = "little" if endianness == "<" else "big"
+        size = TAG_TYPE_SIZE_BYTES.get(type_name, 1)
+
+        try:
+            if type_name == "SHORT":
+                return int.from_bytes(inline_bytes[:2], endian)
+            elif type_name == "LONG":
+                return int.from_bytes(inline_bytes[:4], endian)
+            elif type_name == "SIGNED_SHORT":
+                return int.from_bytes(inline_bytes[:2], endian, signed=True)
+            elif type_name == "SIGNED_LONG":
+                return int.from_bytes(inline_bytes[:4], endian, signed=True)
+            elif size == 1:
+                return inline_bytes[0]
+            else:
+                return int.from_bytes(inline_bytes[:size], endian)
+        except Exception as e:
+            print(f"Error unpacking value: {e}")
+            return "Invalid"
 
     def _read_iptc_data(self, app13_bytes: bytes) -> dict:
         """
@@ -1284,26 +1314,25 @@ class JPEGParser(BaseParser):
         """
         if not self.app1_data:
             raise ValueError(
-                "APP1 metadata not found. Run `get_complete_image_data()` first."
+                "Cannot calculate metrics. APP1 metadata not found. "
+                "Have you tried running `get_complete_image_data()` first?"
             )
 
-        # Baseline lists for comparison scoring
+        # Baseline tag byte-order lists
         baseline_exif = self._sort_by_byte(EXIF_TAG_DICT_REV)
         baseline_gps = self._sort_by_byte(GPS_TAG_DICT_REV)
         baseline_interop = self._sort_by_byte(INTEROP_TAG_DICT_REV)
 
-        # Header Validity Score
-        e = int(bool(self.app1_data.get("EXIF Identifier Offset", False)))
-        t = int(bool(self.app1_data.get("TIFF Magic Number Offset", False)))
-        b = int(bool(self.app1_data.get("Byte Order", None)))
-
-        header_score = calculate_header_validity(e, t, b)
-        self.header_validity_score = header_score
+        # Header Validity Score (H)
+        h_e = int(bool(self.app1_data.get("EXIF Identifier Offset", False)))
+        h_t = int(bool(self.app1_data.get("TIFF Magic Number Offset", False)))
+        h_b = int(bool(self.app1_data.get("Byte Order", None)))
+        header_score = calculate_header_validity(h_e, h_t, h_b)
 
         all_tag_dicts = []
         observed_exif, observed_gps, observed_interop = [], [], []
 
-        # Iterate over IFDs
+        # Collect tag info from all IFDs
         ifds = [
             ("EXIF", self.exif_ifd_data, baseline_exif, observed_exif),
             ("GPS", self.gps_ifd_data, baseline_gps, observed_gps),
@@ -1330,83 +1359,108 @@ class JPEGParser(BaseParser):
                         observed.append(tag_id)
                     all_tag_dicts.append(tag_info)
 
-        # Tag Validity Score
+        # Tag Validity Score (TVS)
         tag_validity_score = calculate_tag_validity_score(all_tag_dicts)
 
-        # Calculate TOS
-        weak_tos_scores = {}
-        strict_tos_scores = {}
-        weak_tag_order_scores = []
-        strict_tag_order_scores = []
+        # Compute Tag Order Scores (TOS)
+        strict_tos_by_ifd = {}
+        lazy_tos_by_ifd = {}
+        strict_scores = []
+        lazy_scores = []
+
+        def handle_ifd(ifd_name, observed, baseline):
+            tag_subset = [t for t in all_tag_dicts if t["tag_id"] in observed]
+            strict = round(calculate_strict_TOS(observed, baseline), 5)
+            lazy = round(calculate_lazy_TOS(tag_subset, baseline), 5)
+            strict_tos_by_ifd[ifd_name] = strict
+            lazy_tos_by_ifd[ifd_name] = lazy
+            strict_scores.append(strict)
+            lazy_scores.append(lazy)
 
         if observed_exif:
-            exif_tag_dicts = [
-                tag for tag in all_tag_dicts if tag["tag_id"] in observed_exif
-            ]
-            weak_tos_scores["EXIF"] = round(
-                calculate_strict_TOS(observed_exif, baseline_exif), 5
-            )
-            strict_tos_scores["EXIF"] = round(
-                calculate_lazy_TOS(exif_tag_dicts, baseline_exif), 5
-            )
-
-            strict_tag_order_scores.append(strict_tos_scores["EXIF"])
-            weak_tag_order_scores.append(weak_tos_scores["EXIF"])
-
+            handle_ifd("EXIF", observed_exif, baseline_exif)
         if observed_gps:
-            gps_tag_dicts = [
-                tag for tag in all_tag_dicts if tag["tag_id"] in observed_gps
-            ]
-            weak_tos_scores["GPS"] = round(
-                calculate_strict_TOS(observed_gps, baseline_gps), 5
-            )
-            strict_tos_scores["GPS"] = round(
-                calculate_lazy_TOS(gps_tag_dicts, baseline_gps), 5
-            )
-
-            strict_tag_order_scores.append(strict_tos_scores["EXIF"])
-            weak_tag_order_scores.append(weak_tos_scores["EXIF"])
-
+            handle_ifd("GPS", observed_gps, baseline_gps)
         if observed_interop:
-            interop_tag_dicts = [
-                tag for tag in all_tag_dicts if tag["tag_id"] in observed_interop
-            ]
-            weak_tos_scores["Interop"] = round(
-                calculate_strict_TOS(observed_interop, baseline_interop), 5
-            )
-            strict_tos_scores["Interop"] = round(
-                calculate_lazy_TOS(interop_tag_dicts, baseline_interop), 5
-            )
+            handle_ifd("Interop", observed_interop, baseline_interop)
 
-            strict_tag_order_scores.append(strict_tos_scores["EXIF"])
-            weak_tag_order_scores.append(weak_tos_scores["EXIF"])
-        # Final tag order score (average of available TOS)
-        weak_tag_order = (
-            round(sum(weak_tag_order_scores) / len(weak_tag_order_scores), 5)
-            if weak_tag_order_scores
-            else 0.0
+        avg_strict_tos = (
+            round(sum(strict_scores) / len(strict_scores), 5) if strict_scores else 0.0
         )
-        strict_tag_order = (
-            round(sum(strict_tag_order_scores) / len(strict_tag_order_scores), 5)
-            if strict_tag_order_scores
-            else 0.0
+        avg_lazy_tos = (
+            round(sum(lazy_scores) / len(lazy_scores), 5) if lazy_scores else 0.0
         )
 
-        # EXIF Conformity Score
-        ecs = round(calculate_ECS(header_score, tag_validity_score, weak_tag_order), 5)
+        # EXIF Conformity Score (ECS)
+        ecs = round(calculate_ECS(header_score, tag_validity_score, avg_strict_tos), 5)
 
+        # Store results
         self.header_validity_score = header_score
         self.tag_validity_score = tag_validity_score
-        self.weak_tag_order_score = weak_tos_scores
-        self.strict_tag_order_score = strict_tag_order
+        self.lazy_tag_order_score = lazy_tos_by_ifd
+        self.strict_tag_order_score = strict_tos_by_ifd
         self.ecs = ecs
+
         return {
-            "Header VAL": round(header_score, 5),
-            "Tag VAL Score": round(tag_validity_score, 5),
-            "Lazy Tag Order Score": strict_tos_scores,
-            "Strict Tag Order Score": weak_tos_scores,
+            "Header Validity": round(header_score, 5),
+            "Tag Validity Score": round(tag_validity_score, 5),
+            "Strict TOS by IFD": strict_tos_by_ifd,
+            "Lazy TOS by IFD": lazy_tos_by_ifd,
             "EXIF Conformity Score": ecs,
         }
+
+def edit_tag_value(self, ifd: str, tag_name: str, new_value: bytes) -> None:
+    if not self.app1_data:
+        raise ValueError("Run get_complete_image_data() before attempting edits.")
+
+    ifd_lookup = {
+        "EXIF": self.exif_ifd_data,
+        "GPS": self.gps_ifd_data,
+        "Interop": self.interop_ifd_data,
+        "Thumbnail": self.thumbnail_ifd_data,
+        "First": self.first_ifd_data,
+    }
+
+    if ifd not in ifd_lookup:
+        raise ValueError(f"Unsupported IFD: {ifd}")
+
+    target_ifd = ifd_lookup[ifd]
+    if not target_ifd or tag_name not in target_ifd:
+        raise ValueError(f"Tag '{tag_name}' not found in {ifd} IFD.")
+
+    tag_info = target_ifd[tag_name]
+    expected = tag_info.get("Expected Count", len(new_value))
+
+    if len(new_value) != expected:
+        raise ValueError(f"Expected {expected} bytes, got {len(new_value)}")
+
+    binary_as_list = bytearray(self.binary_repr)
+
+    if "Value Field Points To" in tag_info and isinstance(tag_info["Value Field Points To"], int):
+        # Overflow storage
+        offset = tag_info["Value Field Points To"]
+    else:
+        # Inline storage — starts 8 bytes after entry start
+        offset = tag_info["Absolute Offset"] + 8
+
+    binary_as_list[offset : offset + len(new_value)] = new_value
+    self.binary_repr = bytes(binary_as_list)
+
+    print(f"[INFO] Edited {tag_name} at offset {offset} to {new_value}")
+
+
+    def save_edited_image(self, output_path: str) -> None:
+        """
+        Saves the edited binary_repr to a new file.
+
+        :param output_path: File path to save the modified image.
+        """
+        try:
+            with open(output_path, "wb") as f:
+                f.write(self.binary_repr)
+            print(f"[INFO] Saved modified image to '{output_path}'")
+        except Exception as e:
+            print(f"[ERROR] Could not save image: {e}")
 
     @staticmethod
     def pretty_print(data: dict):
@@ -1424,11 +1478,3 @@ class JPEGParser(BaseParser):
         if not data:
             raise ValueError("Cannot pretty print an empty dictionary.")
         rich_print(data)
-
-
-# if __name__ == "__main__":
-
-# path = r"D:\image_dataset\Images\Dresden_image_dataset\Agfa_DC-504_0\Agfa_DC-504_0_1.JPG"
-# img = JPEGParser(path)
-# print(img.binary_repr[406:450])
-# print(img.get_complete_image_data())
